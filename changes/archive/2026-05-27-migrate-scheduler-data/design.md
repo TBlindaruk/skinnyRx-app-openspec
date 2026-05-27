@@ -19,7 +19,7 @@ We must carry existing legacy schedules into the new scheduler and prevent doubl
 - No schema migration; legacy `medication_schedules` rows are kept intact (reversible cutover).
 - Not removing the legacy job or legacy tables — that is a later cleanup change.
 - Not migrating any intake quantity/unit history (legacy has none) beyond a sane default.
-- Not touching the weekly `SendPatientDoseReminderWithoutScheduleNotification` job — it keys off the presence of a legacy `MedicationSchedule`, which the migration leaves in place, so migrated patients still count as "has legacy schedule" and are unaffected.
+- Not removing the legacy weekly job; only narrowing whom it nudges (see the weekly-nudge decision below).
 
 ## Decisions
 
@@ -36,21 +36,27 @@ Every legacy schedule has an `order_id`, so each migrated schedule is **order-li
 - `scheduleType` / `scheduleRule` ← branch on `product->getType()`:
   - **INJECTION** → `ScheduleType::WEEKLY`, `WeeklyRuleDto(daysOfWeek: [starts_at->dayOfWeekIso])` (ISO 1=Mon … 7=Sun, exactly one day — anchored on the legacy `starts_at` weekday, same as the legacy weekly cadence).
   - **PILLS** / **DROPS** → `ScheduleType::EVERY_DAY`, `EveryDayRuleDto` (empty rule).
-- `startsOn` ← `starts_at`; `endsOn` ← `null`; `timezone` ← legacy `timezone`.
+- `startsOn` ← `starts_at`; `endsOn` ← `null`; `timezone` ← legacy `timezone`, falling back to `AddressTimezoneResolver` on the order patient's shipping address when the legacy `timezone` is null (same resolver as `medication-schedules:backfill-timezone`). A row whose timezone is null and cannot be resolved is skipped.
 
 ### Idempotency via the creator's own guard, plus a pre-check
 `CreateScheduleValidator` already throws `MedicationTrackingScheduleAlreadyExistsException` for a duplicate `(patient_id, order_id)`. The command ALSO pre-filters with `whereNotExists` against `medication_tracking_schedules` so re-runs skip cleanly and cheaply; the exception is caught as a belt-and-suspenders skip. Limit/product-constraint exceptions are caught, logged, counted as failures, and do not abort the run.
 
 ### Suppress legacy notifications two ways
 1. **Future:** add a `whereNotExists` sub-query against `medication_tracking_schedules` (matching on `order_id`, `whereNull(deleted_at)`) to `SendPatientDoseReminderNotification::initializePendingRows`, so no new pending reminder is created for an order that has a tracking schedule.
-2. **In-flight:** clean up already-queued reminders **on tracking-schedule creation**, via a `MedicationTrackingScheduleObserver::created` hook (registered with `#[ObservedBy]`, per §9). If the created schedule has an `order_id`, it deletes pending unsent (`sent_at IS NULL`) `medication_dose_reminders` for that order's legacy schedule (`MedicationDoseReminderRepository::deleteUnsentByOrderId`). Already-sent rows are kept as history.
+2. **In-flight:** clean up already-queued reminders **on tracking-schedule creation**, via a `MedicationTrackingScheduleObserver::created` hook (registered with `#[ObservedBy]`, per §9). If the created schedule has an `order_id`, the observer resolves the legacy `MedicationSchedule` by `order_id` (via injected `ModelRepository`) and deletes that schedule's pending unsent (`sent_at IS NULL`) `medication_dose_reminders` through the existing `MedicationDoseReminderRepository::deleteUnSentByScheduleId`. Reusing the schedule-scoped method avoids a near-duplicate order-scoped delete; already-sent rows are kept as history.
 
 The observer — not the migration command — is the right home for (2): the `created` event fires for **both** the migration (which calls `ScheduleCreator::create`) and the normal patient API (`ScheduleController::create`). A patient who creates an order-linked tracking schedule through the app would otherwise keep receiving the legacy reminder, since the `whereNotExists` guard only blocks *re-initialization*, not an already-pending row. The hook fires inside the `ScheduleCreator` transaction, so the cleanup is atomic with schedule creation and rolls back if dose generation fails. The migration command therefore no longer touches reminders directly.
 
 This pair fully stops legacy reminders for an order once it has a tracking schedule, without depending on ordering relative to the per-minute job.
 
+### Suppress the weekly no-schedule nudge — patient-level, not order-level
+The weekly `SendPatientDoseReminderWithoutScheduleNotification` job nudges patients with an active order but no schedule. Its legacy check is order-level (`leftJoin medication_schedules ON order_id` + `whereNull(ms.id)`). The new-scheduler exclusion is instead patient-level — a `whereNotExists` against `medication_tracking_schedules` matching `patient_id` with `whereNull(deleted_at)` — because the new scheduler lets a patient create a **custom tracker with no `order_id`**. An order-level match (as in `SendPatientDoseReminderNotification`) would miss those custom trackers and keep nagging a patient who is clearly already tracking. Matching on `patient_id` silences the nudge for any patient with any live tracking schedule, which matches the intent of the reminder ("this patient isn't tracking medication anywhere"). Soft-deleted schedules do not count, so a patient who deleted their only tracker is nudged again.
+
+### Legacy→new mapping lives in a service, not the command
+The legacy→new mapping (timezone resolution + cadence/intake/DTO building) is extracted into `App\Services\MedicationTracking\Schedule\LegacyScheduleConverter` (`final readonly`, constructor-injected `AddressTimezoneResolver` + `LoggerInterface`), exposing one method `convert(MedicationSchedule): ?CreateScheduleDto`. It returns `null` when a row cannot be mapped (no resolvable timezone, no apply times) — a normal "skip", not an error — and logs the reason. This keeps the command a thin orchestrator (§5/§10: logic belongs in a service) and makes the mapping independently testable. The converter is auto-resolved from the container (both dependencies are resolvable), so no provider binding is needed.
+
 ### Command shape
-`final class MigrateLegacySchedulesCommand extends Command`, signature `medication-schedules:migrate-to-tracking {--dry-run}`, DI via `handle(ModelRepository, ScheduleCreator, LoggerInterface)`. Chunk legacy schedules with `chunkById` (size 500), eager-load `order.patient` and `product`. Per row inside a try/catch: build DTO → (skip if dry-run) `create()`. Reminder cleanup is handled by the observer on `created`, not the command. Track `migrated/skipped/failed`, render a summary, return `FAILURE` if any failed else `SUCCESS`. No business logic in the command beyond orchestration.
+`final class MigrateLegacySchedulesCommand extends Command`, signature `medication-schedules:migrate-to-tracking {--dry-run}`, DI via `handle(ModelRepository, ScheduleCreator, LegacyScheduleConverter, LoggerInterface)`. Chunk legacy schedules with `chunkById` (size 500), eager-load `order.patient` and `product`. Per row inside a try/catch: `$converter->convert($schedule)` → (skip if null or dry-run) `create()`. Reminder cleanup is handled by the observer on `created`, not the command. Track `migrated/skipped/failed`, render a summary, return `FAILURE` if any failed else `SUCCESS`. No business logic in the command beyond orchestration.
 
 ## Risks / Trade-offs
 

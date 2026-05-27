@@ -1,4 +1,9 @@
-## ADDED Requirements
+# scheduler-data-migration Specification
+
+## Purpose
+Backfill legacy order-linked `medication_schedules` into the new medication-tracking scheduler and reconcile the legacy dose-reminder pipeline so that, once an order is tracked in the new scheduler, patients are never reminded twice. Covers the migration artisan command (idempotent, dry-run capable) plus the changes to the legacy dose-reminder initialization, the in-flight reminder cleanup on tracking-schedule creation, and the weekly no-schedule nudge exclusion.
+
+## Requirements
 
 ### Requirement: Backfill legacy schedules into the new tracking scheduler
 
@@ -18,9 +23,15 @@ Every legacy schedule is order-linked, so the created schedule SHALL satisfy the
 - **THEN** the system SHALL create one `medication_tracking_schedule` with `schedule_type = weekly` and a `schedule_rule` of `{ "days_of_week": [3] }` (the ISO weekday of `starts_at`)
 - **AND** the materialized `medication_tracking_scheduled_doses` SHALL fall only on that weekday up to the configured horizon
 
-#### Scenario: Legacy schedule is missing a timezone
+#### Scenario: Legacy schedule is missing a timezone but it can be resolved from the shipping address
 
 - **WHEN** the command encounters a legacy `MedicationSchedule` whose `timezone` is null (the `timezone` column is nullable, unlike the non-null `order_id`/`product_id` foreign keys)
+- **THEN** the system SHALL resolve the timezone from the order patient's shipping address using `AddressTimezoneResolver` (the same resolver the `medication-schedules:backfill-timezone` command uses)
+- **AND** SHALL use the resolved timezone to create the new-scheduler record
+
+#### Scenario: Legacy schedule has no timezone and none can be resolved
+
+- **WHEN** a legacy `MedicationSchedule` has a null `timezone` and the timezone cannot be resolved from the shipping address (the patient has no shipping address, or its state is unsupported)
 - **THEN** the system SHALL skip that schedule without creating a new-scheduler record and SHALL count it as skipped, because the new scheduler requires a timezone to materialize doses
 
 ### Requirement: Migration is idempotent and safe to re-run
@@ -68,3 +79,27 @@ Two mechanisms enforce this:
 
 - **WHEN** a custom `medication_tracking_schedule` with no `order_id` is created
 - **THEN** the system SHALL NOT delete any `medication_dose_reminders`
+
+### Requirement: Stop the weekly no-schedule nudge for patients who already track
+
+The weekly `SendPatientDoseReminderWithoutScheduleNotification` job (the Saturday cron) nudges patients with an active order but no medication schedule to set one up. It SHALL NOT nudge a patient who already tracks medication in the new scheduler. The exclusion SHALL be patient-level: a patient who has any non-deleted `medication_tracking_schedule` (`deleted_at IS NULL`) SHALL be excluded, regardless of whether that schedule is linked to an order. The pre-existing legacy check SHALL remain order-level: a patient SHALL still be selected only if they have at least one active order with no legacy `medication_schedules` row. A patient SHALL therefore receive the weekly nudge only when they have an active order without a legacy schedule AND have no non-deleted tracking schedule at all.
+
+#### Scenario: Patient with a new tracking schedule is not nudged
+
+- **WHEN** the weekly job runs and a patient has an active order with no legacy `medication_schedules` row but has a non-deleted `medication_tracking_schedule`
+- **THEN** the system SHALL NOT send that patient the no-schedule dose reminder
+
+#### Scenario: Patient with only a custom (no-order) tracking schedule is not nudged
+
+- **WHEN** the weekly job runs and a patient has an active order with no legacy schedule and their only tracking schedule has a null `order_id`
+- **THEN** the system SHALL NOT send that patient the no-schedule dose reminder, because the exclusion matches on `patient_id`
+
+#### Scenario: Patient with no schedule of any kind is still nudged
+
+- **WHEN** the weekly job runs and a patient has an active order with no legacy `medication_schedules` row and no non-deleted `medication_tracking_schedule`
+- **THEN** the system SHALL send that patient the no-schedule dose reminder as before
+
+#### Scenario: Soft-deleted tracking schedule does not suppress the nudge
+
+- **WHEN** the weekly job runs and a patient's only `medication_tracking_schedule` is soft-deleted (`deleted_at` is not null)
+- **THEN** that schedule SHALL NOT count as tracking, and the patient SHALL be nudged if they otherwise qualify
