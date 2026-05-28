@@ -9,6 +9,8 @@ The system SHALL allow an authenticated patient to create a medication schedule 
 
 The supported `schedule_type` values are `every_day`, `weekly`, `every_few_days`, and `as_needed`. The `schedule_rule` payload SHALL carry only rule-specific metadata (e.g. `days_of_week` for `weekly`, `interval_days` for `every_few_days`); intakes SHALL be a top-level array on the request and on the response, never embedded inside `schedule_rule`.
 
+For `every_day`, `weekly`, and `every_few_days` schedules, the `schedule_rule.intakes[*].time` values SHALL be distinct within a single request. Enforcement happens at the FormRequest layer via Laravel's built-in `distinct` rule on `schedule_rule.intakes.*.time`; the database partial unique index `(medication_tracking_schedule_id, time)` remains the authoritative race guard against concurrent writes but SHALL NOT be the patient-facing error path. `as_needed` is unaffected — that schedule type permits exactly one intake and prohibits `time`.
+
 `localStartsOn` (the request's `starts_on` interpreted in the request's `timezone`) SHALL NOT be earlier than today in that timezone. Enforcement happens in `CreateScheduleValidator::assertStartsOnNotInPast(...)` as the FIRST step of `validate(...)`, mirroring `UpdateScheduleValidator::assertEndsOnNotInPast(...)` on the edit path. A violation SHALL throw `StartsOnInPastException` (extending `\DomainException`); the controller SHALL map it to `422 {"message": "The starts_on date cannot be before today in the schedule timezone."}`. The check MUST run before any DB query, so a past-`starts_on` request SHALL NOT incur the schedule-cap `count(*)` or the duplicate-order existence lookup. When `starts_on` is omitted on the `as_needed` path, `CreateRequest::getStartsOnLocal()` SHALL continue to default it to "today in the provided timezone" — the check is satisfied trivially.
 
 #### Scenario: Patient creates an every-day custom schedule
@@ -35,6 +37,12 @@ The supported `schedule_type` values are `every_day`, `weekly`, `every_few_days`
 - **WHEN** the patient POSTs with zero or more than 16 intakes for a non-`as_needed` schedule
 - **THEN** the system SHALL respond `422 Unprocessable Entity` with a validation error
 - **AND** no schedule, intake, or dose row SHALL be persisted
+
+#### Scenario: Patient sends two intakes with the same `time` on a non-`as_needed` schedule
+- **WHEN** the patient POSTs with `schedule_type` ∈ {`every_day`, `weekly`, `every_few_days`} and an `schedule_rule.intakes` array containing two entries whose `time` strings are equal (e.g. both `09:00`)
+- **THEN** the system SHALL respond `422` with a validation error keyed on the duplicate index — `{ "schedule_rule.intakes.<index>.time": [...] }` — produced by the FormRequest's `distinct` rule
+- **AND** no database transaction SHALL be opened and no schedule, intake, or dose row SHALL be persisted
+- **AND** the response SHALL NOT include the raw `SQLSTATE[23505]` text or any database constraint name
 
 #### Scenario: Patient sends an invalid timezone
 - **WHEN** the patient POSTs with a `timezone` that is not a valid IANA zone
@@ -203,6 +211,8 @@ The system SHALL expose `PUT /api/v1/patient/medication-tracking/schedules/{sche
 - `schedule_rule` (the rule shape MUST match the resulting `schedule_type`),
 - intakes (full replacement — the new intake list replaces the old row-set).
 
+For `every_day`, `weekly`, and `every_few_days` schedule types, the replacement intake list MUST contain distinct `time` values. Enforcement happens at the FormRequest layer via the same `distinct` rule used on the create path; the database partial unique index `(medication_tracking_schedule_id, time)` remains the authoritative race guard but SHALL NOT be the patient-facing error path. `as_needed` is unaffected (single-intake, `time` prohibited).
+
 **Immutable fields** — `name`, `starts_on`, `timezone`, `product_id`, `order_id`. The request body MAY include them but the server SHALL ignore them: the FormRequest doesn't validate them, the DTO doesn't carry them, and the persistence layer never reads them. End state: their values on the row are unchanged after the edit.
 
 For order-linked schedules the existing `ProductConstraintValidator` rules still apply: intake count, intake `unit`, `PlannedQuantityForProductType` bounds, INJECTION `days_of_week.length == 1`, and the locked `schedule_type`.
@@ -243,6 +253,12 @@ The response SHALL be `200` with the updated `ScheduleResource` (intakes + produ
 #### Scenario: Patient sets `ends_on` to a past date
 - **WHEN** the request includes `ends_on` < today in the schedule's timezone
 - **THEN** the system SHALL respond `422` with a validation error on `ends_on`
+
+#### Scenario: Patient PUTs two intakes with the same `time` on a non-`as_needed` schedule
+- **WHEN** the owner PUTs a custom schedule with `schedule_type` ∈ {`every_day`, `weekly`, `every_few_days`} and a replacement `schedule_rule.intakes` array containing two entries whose `time` strings are equal (e.g. both `09:00`)
+- **THEN** the system SHALL respond `422` with a validation error keyed on the duplicate index — `{ "schedule_rule.intakes.<index>.time": [...] }` — produced by the FormRequest's `distinct` rule
+- **AND** no database transaction SHALL be opened; the existing schedule row, its intakes, and its future-unlogged doses SHALL be unchanged
+- **AND** the response SHALL NOT include the raw `SQLSTATE[23505]` text or any database constraint name
 
 #### Scenario: Edit narrows the window past existing future doses
 - **WHEN** the schedule had doses already materialized out to `+360 days` and the patient PUTs `ends_on = now + 30 days`
