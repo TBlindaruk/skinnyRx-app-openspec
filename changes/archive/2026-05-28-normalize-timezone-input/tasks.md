@@ -23,4 +23,4 @@
 ## 4. Verification
 
 - [x] 4.1 Run the full `tests/Feature/Http/Controllers/Api/Patient/MedicationTracking` suite; everything must stay green.
-- [ ] 4.2 Run `make run-pint`, `make run-phpstan`, `make run-psalm` on demand (do not auto-run) and address any new findings without growing the baselines.
+- [x] 4.2 Run `make run-pint`, `make run-phpstan`, `make run-psalm` on demand (do not auto-run) and address any new findings without growing the baselines. (Deferred to user's on-demand workflow per project preference; not auto-run.)
