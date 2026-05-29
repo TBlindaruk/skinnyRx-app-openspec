@@ -9,7 +9,11 @@ The system SHALL allow an authenticated patient to create a medication schedule 
 
 The supported `schedule_type` values are `every_day`, `weekly`, `every_few_days`, and `as_needed`. The `schedule_rule` payload SHALL carry only rule-specific metadata (e.g. `days_of_week` for `weekly`, `interval_days` for `every_few_days`); intakes SHALL be a top-level array on the request and on the response, never embedded inside `schedule_rule`.
 
+For `every_day`, `weekly`, and `every_few_days` schedules, the `schedule_rule.intakes[*].time` values SHALL be distinct within a single request. Enforcement happens at the FormRequest layer via Laravel's built-in `distinct` rule on `schedule_rule.intakes.*.time`; the database partial unique index `(medication_tracking_schedule_id, time)` remains the authoritative race guard against concurrent writes but SHALL NOT be the patient-facing error path. `as_needed` is unaffected — that schedule type permits exactly one intake and prohibits `time`.
+
 `localStartsOn` (the request's `starts_on` interpreted in the request's `timezone`) SHALL NOT be earlier than today in that timezone. Enforcement happens in `CreateScheduleValidator::assertStartsOnNotInPast(...)` as the FIRST step of `validate(...)`, mirroring `UpdateScheduleValidator::assertEndsOnNotInPast(...)` on the edit path. A violation SHALL throw `StartsOnInPastException` (extending `\DomainException`); the controller SHALL map it to `422 {"message": "The starts_on date cannot be before today in the schedule timezone."}`. The check MUST run before any DB query, so a past-`starts_on` request SHALL NOT incur the schedule-cap `count(*)` or the duplicate-order existence lookup. When `starts_on` is omitted on the `as_needed` path, `CreateRequest::getStartsOnLocal()` SHALL continue to default it to "today in the provided timezone" — the check is satisfied trivially.
+
+The `timezone` field SHALL accept any IANA name in PHP's `DateTimeZone::ALL_WITH_BC` set — i.e. canonical zones (e.g. `Europe/Kyiv`, `America/New_York`) **and** the backward-compatibility aliases PHP recognizes (`Europe/Kiev`, `US/Eastern`, `Asia/Calcutta`, …). Deprecated aliases covered by the [[timezone-normalization]] capability (at minimum `Europe/Kiev`) SHALL be normalized to their canonical form (`Europe/Kyiv`) at the request boundary, so the stored and returned value is the canonical identifier rather than the submitted alias; values with no normalization entry are stored and returned unchanged. Unknown identifiers (case-mismatched or not in `ALL_WITH_BC`) MUST be rejected with `422`.
 
 #### Scenario: Patient creates an every-day custom schedule
 - **WHEN** the patient POSTs to `/api/v1/patient/medication-tracking/schedules` with `schedule_type=every_day`, `starts_on`, a valid IANA `timezone`, and 1–16 intakes each with `time` (`H:i`), `quantity > 0`, and a `unit` from `DoseUnit`
@@ -36,9 +40,20 @@ The supported `schedule_type` values are `every_day`, `weekly`, `every_few_days`
 - **THEN** the system SHALL respond `422 Unprocessable Entity` with a validation error
 - **AND** no schedule, intake, or dose row SHALL be persisted
 
+#### Scenario: Patient sends two intakes with the same `time` on a non-`as_needed` schedule
+- **WHEN** the patient POSTs with `schedule_type` ∈ {`every_day`, `weekly`, `every_few_days`} and an `schedule_rule.intakes` array containing two entries whose `time` strings are equal (e.g. both `09:00`)
+- **THEN** the system SHALL respond `422` with a validation error keyed on the duplicate index — `{ "schedule_rule.intakes.<index>.time": [...] }` — produced by the FormRequest's `distinct` rule
+- **AND** no database transaction SHALL be opened and no schedule, intake, or dose row SHALL be persisted
+- **AND** the response SHALL NOT include the raw `SQLSTATE[23505]` text or any database constraint name
+
 #### Scenario: Patient sends an invalid timezone
-- **WHEN** the patient POSTs with a `timezone` that is not a valid IANA zone
+- **WHEN** the patient POSTs with a `timezone` value not in `DateTimeZone::ALL_WITH_BC` (e.g. `Not/A_Zone`, or `europe/kiev` with the wrong case)
 - **THEN** the system SHALL respond `422` with a validation error on `timezone`
+
+#### Scenario: Patient sends a deprecated IANA alias
+- **WHEN** the patient POSTs with `timezone=Europe/Kiev`
+- **THEN** the system SHALL respond `201` with the schedule persisted and returned using the canonical form `Europe/Kyiv`
+- **AND** an alias that has no normalization entry (e.g. `US/Eastern`, `Asia/Calcutta`) SHALL be persisted unchanged
 
 #### Scenario: Patient sends `ends_on` earlier than `starts_on`
 - **WHEN** the patient POSTs with `ends_on < starts_on`
@@ -73,14 +88,19 @@ For order-linked schedules the system SHALL enforce, in addition to the custom-s
 - `name` matches the product name,
 - `schedule_type` is `every_day` for `PILLS`/`DROPS` and `weekly` for `INJECTION`,
 - exactly one intake,
-- the intake `unit` matches `DoseUnit::forProductType(...)`,
-- `quantity` is within the product type's planned-quantity bounds (`PlannedQuantityForProductType`),
+- the intake `unit` matches `DoseUnit::forProductType(...)` — which is `unit` for `INJECTION`, `mg` for `PILLS`, and `ml` for `DROPS`,
+- `quantity` is within the product type's planned-quantity bounds (`PlannedQuantityForProductType`); for `PILLS` the quantity MUST be a whole number (entered as whole `mg`),
 - for `INJECTION`, `schedule_rule.days_of_week` contains exactly one day.
 
 #### Scenario: Patient creates a weekly injection schedule from an order
-- **WHEN** the patient POSTs with `order_id` referencing an active injection order, `schedule_type=weekly`, one intake whose `unit=injection`, and `days_of_week=[3]`
+- **WHEN** the patient POSTs with `order_id` referencing an active injection order, `schedule_type=weekly`, one intake whose `unit=unit`, and `days_of_week=[3]`
 - **THEN** the system SHALL respond `201` with `product_id` and `order_id` populated from the resolved order, and `image_path` resolved from the product
 - **AND** the schedule row in `medication_tracking_schedules` SHALL carry both `product_id` (denormalized from the order) and `order_id`
+
+#### Scenario: Patient creates an every-day pills schedule from an order
+- **WHEN** the patient POSTs with `order_id` referencing an active pills order, `schedule_type=every_day`, and one intake whose `unit=mg` and a whole-number `quantity`
+- **THEN** the system SHALL respond `201` with `product_id` and `order_id` populated from the resolved order
+- **AND** the schedule row SHALL carry both `product_id` and `order_id`
 
 #### Scenario: Patient sends an `order_id` that does not resolve to an active order they own
 - **WHEN** the patient POSTs with an `order_id` that is not theirs, is cancelled, or does not exist
@@ -88,7 +108,7 @@ For order-linked schedules the system SHALL enforce, in addition to the custom-s
 - **AND** the system SHALL NOT open a database transaction
 
 #### Scenario: Patient sends an order-locked field that drifts from the prescribed product
-- **WHEN** the patient POSTs with an `order_id` and any of: a `name` that does not match the product name; a `schedule_type` that is not the product's mandated type; more than one intake; an intake `unit` that does not match `DoseUnit::forProductType(...)`; an injection schedule with `days_of_week.length != 1`; or a `quantity` outside the product type's planned-quantity bounds
+- **WHEN** the patient POSTs with an `order_id` and any of: a `name` that does not match the product name; a `schedule_type` that is not the product's mandated type; more than one intake; an intake `unit` that does not match `DoseUnit::forProductType(...)` (e.g. `unit=injection` for an injection order, or `unit=unit` for a pills order); an injection schedule with `days_of_week.length != 1`; or a `quantity` outside the product type's planned-quantity bounds (e.g. a fractional `quantity` for pills)
 - **THEN** the system SHALL respond `422` with a `ProductConstraintException` message
 - **AND** no schedule, intake, or dose row SHALL be persisted
 
@@ -201,10 +221,11 @@ The system SHALL define an artisan command `medication-tracking:regenerate-doses
 
 - not soft-deleted (the default `SoftDeletes` global scope MUST apply);
 - `schedule_type != as_needed`;
-- `ends_on IS NULL` OR `ends_on >= today` (server-time UTC date is acceptable for this coarse filter — the per-schedule job re-evaluates in the schedule's timezone);
-- the schedule's patient has at least one order whose `status` is in `OrderStatus::active()` (`paid`, `sent_to_pharmacy`, `intake_completed`, `nurse_approved`, `charged`, `shipped`, `ready_for_refill`, `delivered`). Schedules whose patient has no active orders SHALL be skipped — they correspond to churned or never-onboarded patients for whom continuing to materialize doses adds no value. The patient-active check applies uniformly to custom (`order_id IS NULL`) and order-linked schedules: it is a per-patient gate, not a per-schedule-order check.
+- `ends_on IS NULL` OR `ends_on >= today` (server-time UTC date is acceptable for this coarse filter — the per-schedule job re-evaluates in the schedule's timezone).
 
-The command SHALL stream the rows via `ModelRepository::getQuery(...)->cursor()`. The eligibility query SHALL be a single SQL statement with a `WHERE EXISTS (SELECT 1 FROM orders o WHERE o.patient_id = mts.patient_id AND o.status IN (OrderStatus::active()))` semi-join predicate. The `EXISTS` form is preferred over an `INNER JOIN orders + DISTINCT` because it short-circuits per patient (the planner can stop scanning a patient's orders as soon as one active row is found) and avoids a `DISTINCT` phase to dedup the row multiplication a JOIN would produce when a patient has multiple active orders.
+The command SHALL NOT filter schedules by the patient's order status. Eligibility is a property of the schedule alone (type / `ends_on` / not-trashed); a schedule is topped up regardless of whether its patient has any order in `OrderStatus::active()`. (A patient-state eligibility gate may be reintroduced later under a better-defined rule; it is intentionally absent for now.)
+
+The command SHALL stream the rows via `ModelRepository::getQuery(...)->cursor()`. The eligibility query SHALL be a single SQL statement applying only the type / `ends_on` / soft-delete predicates above, with no semi-join against `orders`.
 
 The same SELECT SHALL include a correlated subquery aliased `last_scheduled_at` returning `MAX(medication_tracking_scheduled_doses.scheduled_at) WHERE medication_tracking_schedule_id = medication_tracking_schedules.id AND type = 'scheduled'`, so the cron does not need a second round-trip per schedule to discover where the previous materialization left off.
 
@@ -234,7 +255,7 @@ The artisan command takes no arguments or options — it always operates over ev
 
 #### Scenario: Monthly cron tops up a long-running open-ended schedule by resuming from the last generated dose
 
-- **WHEN** a non-trashed, non-`as_needed` schedule has `ends_on=null`, `starts_on=2026-01-15`, doses materialized up to `2027-01-15` (last generated dose local date), and a patient with at least one order whose `status` is in `OrderStatus::active()`
+- **WHEN** a non-trashed, non-`as_needed` schedule has `ends_on=null`, `starts_on=2026-01-15`, and doses materialized up to `2027-01-15` (last generated dose local date)
 - **AND** the monthly cron fires on `2026-09-01 02:00 UTC`
 - **THEN** the command SHALL compute `localWindowStart = 2027-01-16 00:00 in schedule.timezone` (the day AFTER the last generated dose's local date — strictly greater than `starts_on`)
 - **AND** `endOfHorizon = 2026-09-01 + 365 days` in the schedule's timezone
@@ -264,7 +285,7 @@ The artisan command takes no arguments or options — it always operates over ev
 
 #### Scenario: Monthly cron clips at `ends_on`
 
-- **WHEN** a schedule has `ends_on = today + 60 days`, last `scheduled`-type dose at `today + 60 days`, and a patient with at least one active order
+- **WHEN** a schedule has `ends_on = today + 60 days` and last `scheduled`-type dose at `today + 60 days`
 - **AND** the cron dispatches and the job runs
 - **THEN** `localWindowStart = today + 61` (day after last dose), `endOfHorizon = today + 365`, `maxDays = 304`
 - **AND** the generator passes those into `ScheduleLocalWindowResolver`, which clamps the window's `end` to `ends_on + 1 day = today + 61` because `ends_on < windowStart + maxDays`
@@ -283,21 +304,11 @@ The artisan command takes no arguments or options — it always operates over ev
 - **THEN** the command SHALL NOT dispatch a job for it
 - **AND** no dose row SHALL be added for that schedule
 
-#### Scenario: Cron skips schedules of patients with no active orders
+#### Scenario: Cron dispatches for an eligible schedule even when the patient has no active order
 
-- **WHEN** a patient owns only schedules that pass the type / `ends_on` filters, but has zero orders whose `status` is in `OrderStatus::active()` (every order is `canceled`, `on_hold`, `payment_error/cancelled`, etc., or the patient has no orders at all)
-- **THEN** the command SHALL NOT dispatch any `RegenerateScheduledDosesJob` for that patient's schedules — neither the custom ones (`order_id IS NULL`) nor the order-linked ones
-- **AND** existing dose rows for those schedules SHALL be untouched (the cron only ever inserts, never deletes)
-
-#### Scenario: Cron dispatches for custom schedules of a patient who has any active order
-
-- **WHEN** a patient owns one custom schedule (`order_id IS NULL`) and one order whose `status` is in `OrderStatus::active()` (the active order need not be related to the custom schedule)
-- **THEN** the command SHALL dispatch a `RegenerateScheduledDosesJob` for the custom schedule — the patient-active gate is a per-patient predicate, not a per-schedule one
-
-#### Scenario: Cron dispatches for an order-linked schedule when the patient has at least one active order
-
-- **WHEN** a patient owns an order-linked schedule whose underlying order is `canceled`, but also owns a separate order whose `status` is in `OrderStatus::active()`
-- **THEN** the command SHALL dispatch a `RegenerateScheduledDosesJob` for the schedule — the gate checks "patient has any active order", not "the schedule's specific order is active"
+- **WHEN** a patient owns a non-trashed, non-`as_needed` schedule with `ends_on` null or `>= today`, and zero orders whose `status` is in `OrderStatus::active()` (every order is `canceled` / `on_hold` / etc., or the patient has no orders at all)
+- **THEN** the command SHALL still dispatch a `GenerateScheduledDosesJob` for that schedule — the patient's order status is no longer part of the eligibility filter
+- **AND** the same holds for both custom (`order_id IS NULL`) and order-linked schedules
 
 #### Scenario: Schedule is soft-deleted between dispatch and run
 
@@ -313,38 +324,11 @@ The artisan command takes no arguments or options — it always operates over ev
 - **THEN** `ScheduleLocalWindowResolver::clampEnd` SHALL produce a window where `end <= start`, `ScheduledDoseGenerator` SHALL detect the empty window and return immediately, and the job SHALL exit cleanly without inserting rows
 - **AND** the job SHALL NOT be marked failed
 
-#### Scenario: Cron run dispatches each eligible schedule exactly once even when the patient has many active orders
-
-- **WHEN** an eligible schedule's patient owns five orders all in `OrderStatus::active()` (e.g. multiple subscriptions)
-- **THEN** the command's `WHERE EXISTS` semi-join SHALL yield the schedule exactly once — no row multiplication, no `DISTINCT` needed
-- **AND** the command SHALL dispatch exactly one `GenerateScheduledDosesJob` for that schedule, not one per active order
-
 #### Scenario: Job is idempotent under re-run
 
 - **WHEN** the cron dispatches `GenerateScheduledDosesJob` twice in a row for the same schedule with no intervening changes
 - **THEN** the first run inserts the missing tail (possibly zero rows if already current)
-- **AND** the second run inserts **zero** additional rows — the partial unique index causes every conflicting `insertOrIgnore` to be a no-op
-
-#### Scenario: Cron run overlaps an in-flight edit
-
-- **WHEN** a cron-dispatched `GenerateScheduledDosesJob` for schedule `X` is processed concurrently with an edit transaction on the same schedule that is hard-deleting future, unlogged `scheduled`-type doses
-- **THEN** the operations SHALL NOT deadlock (the cron job touches only the doses table; the edit holds row locks on the schedule + intake rows)
-- **AND** the final state SHALL converge: the edit's post-commit `GenerateScheduledDosesJob` (and/or the cron's re-run on the next month) materializes the correct doses for the new shape of the schedule
-- **AND** no logged dose row (`tracking_log_id IS NOT NULL`) SHALL be modified or removed by either path
-
-#### Scenario: One schedule's job fails — others continue
-
-- **WHEN** the cron has dispatched `GenerateScheduledDosesJob` for 1 000 schedules and the job for schedule `X` throws (e.g. a malformed `schedule_rule` makes the strategy throw)
-- **THEN** only the job for schedule `X` SHALL be retried by the queue's normal backoff and eventually dead-lettered
-- **AND** the jobs for the other 999 schedules SHALL complete independently and successfully
-
-#### Scenario: Past doses are never touched
-
-- **WHEN** the cron-dispatched `GenerateScheduledDosesJob` runs against a schedule with materialized historical doses (some logged, some unlogged) at `scheduled_at < localToday`
-- **THEN** zero past dose rows SHALL be modified, inserted, or deleted by the job — `ScheduledDoseGenerator` only inserts forward from `localWindowStart`
-- **AND** rows with `tracking_log_id IS NOT NULL` SHALL be untouched regardless of their `scheduled_at`
-
----
+- **AND** the second run inserts zero net new rows because `insertOrIgnore` plus the partial unique index `(intake_id, scheduled_at) WHERE type = 'scheduled'` collapse the overlap
 
 ### Requirement: Edit a medication schedule
 
@@ -355,6 +339,8 @@ The system SHALL expose `PUT /api/v1/patient/medication-tracking/schedules/{sche
 - `schedule_type` (custom schedules only — order-linked schedules keep the product-mandated type),
 - `schedule_rule` (the rule shape MUST match the resulting `schedule_type`),
 - intakes (full replacement — the new intake list replaces the old row-set).
+
+For `every_day`, `weekly`, and `every_few_days` schedule types, the replacement intake list MUST contain distinct `time` values. Enforcement happens at the FormRequest layer via the same `distinct` rule used on the create path; the database partial unique index `(medication_tracking_schedule_id, time)` remains the authoritative race guard but SHALL NOT be the patient-facing error path. `as_needed` is unaffected (single-intake, `time` prohibited).
 
 **Immutable fields** — `name`, `starts_on`, `timezone`, `product_id`, `order_id`. The request body MAY include them but the server SHALL ignore them: the FormRequest doesn't validate them, the DTO doesn't carry them, and the persistence layer never reads them. End state: their values on the row are unchanged after the edit.
 
@@ -396,6 +382,12 @@ The response SHALL be `200` with the updated `ScheduleResource` (intakes + produ
 #### Scenario: Patient sets `ends_on` to a past date
 - **WHEN** the request includes `ends_on` < today in the schedule's timezone
 - **THEN** the system SHALL respond `422` with a validation error on `ends_on`
+
+#### Scenario: Patient PUTs two intakes with the same `time` on a non-`as_needed` schedule
+- **WHEN** the owner PUTs a custom schedule with `schedule_type` ∈ {`every_day`, `weekly`, `every_few_days`} and a replacement `schedule_rule.intakes` array containing two entries whose `time` strings are equal (e.g. both `09:00`)
+- **THEN** the system SHALL respond `422` with a validation error keyed on the duplicate index — `{ "schedule_rule.intakes.<index>.time": [...] }` — produced by the FormRequest's `distinct` rule
+- **AND** no database transaction SHALL be opened; the existing schedule row, its intakes, and its future-unlogged doses SHALL be unchanged
+- **AND** the response SHALL NOT include the raw `SQLSTATE[23505]` text or any database constraint name
 
 #### Scenario: Edit narrows the window past existing future doses
 - **WHEN** the schedule had doses already materialized out to `+360 days` and the patient PUTs `ends_on = now + 30 days`
@@ -445,11 +437,50 @@ The system SHALL expose `GET /api/v1/patient/medication-tracking/schedules` retu
 
 ---
 
+### Requirement: Show a single medication schedule
+
+The system SHALL expose `GET /api/v1/patient/medication-tracking/schedules/{schedule}` returning a single `ScheduleResource` for the schedule identified by the path. The shape of the response item MUST be identical to one item from `GET /schedules` — i.e. `id`, `name`, `product_id`, `order_id`, `schedule_type`, `schedule_rule`, `intakes` (eager-loaded array of `ScheduleIntakeResource`), `starts_on`, `ends_on`, `timezone`, `image_path` (resolved from the linked product, or `null` for custom schedules), and `created_at`.
+
+Authorization MUST go through the existing `can:manage,schedule` policy — only the owning patient SHALL receive `200`; any other authenticated patient SHALL receive `403`. The route binding MUST NOT resolve soft-deleted schedules, so a deleted schedule (or a non-existent id) SHALL return `404`. Unauthenticated requests SHALL return `401`.
+
+The controller MUST eager-load the `intakes` and `product` relations before passing the model to `ScheduleResource` so that `intakes` and `image_path` are populated; lazy loading is not acceptable because `whenLoaded` would silently return an empty intakes array.
+
+#### Scenario: Owning patient fetches a custom schedule
+- **WHEN** the owning patient GETs `/api/v1/patient/medication-tracking/schedules/{schedule}` for a custom (no order) schedule they own
+- **THEN** the system SHALL respond `200` with a single `ScheduleResource`
+- **AND** the response SHALL contain `product_id = null`, `order_id = null`, `image_path = null`, `intakes` populated from the persisted intakes, and the same `created_at`/`starts_on`/`timezone` echo as the list endpoint would return
+
+#### Scenario: Owning patient fetches an order-linked schedule
+- **WHEN** the owning patient GETs the endpoint for an order-linked schedule
+- **THEN** the system SHALL respond `200` with `product_id` and `order_id` populated and `image_path` resolved from the linked product (same value the list endpoint produces for the same schedule)
+
+#### Scenario: Different patient tries to fetch
+- **WHEN** an authenticated patient GETs a schedule whose `patient_id` is not theirs
+- **THEN** `can:manage,schedule` SHALL return `403`
+- **AND** no schedule data SHALL be returned in the response body
+
+#### Scenario: Schedule does not exist
+- **WHEN** the patient GETs a `{schedule}` id that does not exist
+- **THEN** Laravel's implicit route binding SHALL return `404` before the controller runs
+
+#### Scenario: Schedule is soft-deleted
+- **WHEN** the patient GETs a `{schedule}` id whose row has `deleted_at` set
+- **THEN** the implicit route binding SHALL NOT resolve the trashed row and the system SHALL respond `404`
+- **AND** the response SHALL NOT leak any field of the deleted schedule
+
+#### Scenario: Unauthenticated request
+- **WHEN** the endpoint is called without a valid patient session
+- **THEN** the system SHALL respond `401` with the standard `UnauthorizedError` payload
+
+---
+
 ### Requirement: Show scheduled doses for a single local day
 
 The system SHALL expose `GET /api/v1/patient/medication-tracking/scheduled-doses` returning a non-paginated array of dose rows for the requested local day. The query MUST return both (a) scheduled-but-not-logged doses whose `scheduled_at` falls in the day window and (b) every dose (scheduled or off-schedule) whose attached `tracking_log.logged_at` falls in the day window. The result MUST be ordered by `COALESCE(logged_at, scheduled_at)`.
 
 The day window MUST be computed by converting `date` + `timezone` into the storage TZ and using `[dayStart, dayStart + 1 day)`. Each dose item MUST expose `planned_timezone` (the schedule's TZ) and `requested_timezone` (the TZ from the request) so the FE can detect mismatches.
+
+The `timezone` query parameter SHALL accept any IANA name in `DateTimeZone::ALL_WITH_BC` (canonical or backward-compatibility alias). Day-window math MUST produce identical results regardless of which form the patient sent (PHP's `DateTimeZone` treats both as the same zone). Unknown identifiers MUST be rejected with `422`.
 
 #### Scenario: Patient asks for today's doses
 - **WHEN** the patient GETs `?date=2026-05-15&timezone=America/New_York`
@@ -464,11 +495,21 @@ The day window MUST be computed by converting `date` + `timezone` into the stora
 - **WHEN** the patient logged an off-schedule dose during the requested day
 - **THEN** the response SHALL include the corresponding `off_schedule` dose row with its nested `tracking_log` populated, regardless of its `scheduled_at`
 
+#### Scenario: Patient queries with a deprecated IANA alias
+- **WHEN** the patient GETs `?date=2026-05-15&timezone=Europe/Kiev`
+- **THEN** the response SHALL be identical to the same query with `timezone=Europe/Kyiv` (same items, same order)
+
+#### Scenario: Patient queries with an unknown timezone
+- **WHEN** the patient GETs with a `timezone` value not in `DateTimeZone::ALL_WITH_BC`
+- **THEN** the system SHALL respond `422` with a validation error on `timezone`
+
 ---
 
 ### Requirement: Return the next upcoming scheduled dose
 
 The system SHALL expose `GET /api/v1/patient/medication-tracking/scheduled-doses/next` returning the next `type = 'scheduled'` dose whose `scheduled_at` is at or after the start of the requested local day. If none exists, the endpoint SHALL return `204 No Content` with an empty body.
+
+The `timezone` query parameter SHALL accept any IANA name in `DateTimeZone::ALL_WITH_BC`. Unknown identifiers MUST be rejected with `422`.
 
 #### Scenario: Patient has an upcoming dose
 - **WHEN** the patient GETs `?date=2026-05-15&timezone=America/New_York` and at least one scheduled, future dose exists
@@ -481,6 +522,14 @@ The system SHALL expose `GET /api/v1/patient/medication-tracking/scheduled-doses
 #### Scenario: `next` skips off-schedule rows
 - **WHEN** the patient's only future dose is an `off_schedule` row
 - **THEN** the endpoint SHALL ignore it and respond `204` — `next` SHALL only consider `type = 'scheduled'`
+
+#### Scenario: Patient asks for the next dose with a deprecated IANA alias
+- **WHEN** the patient GETs `?date=2026-05-15&timezone=Europe/Kiev`
+- **THEN** the response SHALL be identical to the same query with `timezone=Europe/Kyiv`
+
+#### Scenario: Patient asks for the next dose with an unknown timezone
+- **WHEN** the patient GETs with a `timezone` value not in `DateTimeZone::ALL_WITH_BC`
+- **THEN** the system SHALL respond `422` with a validation error on `timezone`
 
 ---
 
@@ -517,10 +566,32 @@ The system SHALL expose `POST /api/v1/patient/medication-tracking/tracking-logs/
 
 `logged_at` is optional; when provided it MUST be a strict ISO 8601 string with offset (`Y-m-d\TH:i:sP`) and SHALL default to "now" otherwise. The action SHALL throw `ScheduledDoseTooFarInFutureException` when `dose.scheduled_at > now + 1 day`, which the controller MUST map to `422`.
 
-#### Scenario: Patient logs "taken" against a planned slot
-- **WHEN** the patient POSTs with a valid `medication_dose_id`, `medication_action=taken`, `dose_value`, `pain_level`, optional `note`
+`pain_level` (integer, `between:0,10`) SHALL be required if and only if the resolved schedule's product is of type `INJECTION`. For schedules whose product is `PILLS` or `DROPS`, or for custom schedules whose `product_id IS NULL`, `pain_level` MUST be absent (or explicitly `null`); supplying a value SHALL cause the action to throw `PainLevelDoesNotMatchProductException` ("The pain level field must not be present for this medication."), which the controller MUST map to `422` with a `{"message": ...}` body. Omitting `pain_level` for an injection schedule SHALL throw the same exception with the message "The pain level field is required for this medication." When the rule allows omission, the persisted `tracking_logs.pain_level` SHALL be `NULL`.
+
+#### Scenario: Patient logs "taken" against a planned slot for an injection
+- **WHEN** the patient POSTs with a valid `medication_dose_id` resolving to an injection schedule, `medication_action=taken`, `dose_value`, `pain_level`, optional `note`
 - **THEN** the system SHALL respond `201` with a `TrackingLogResource` whose `medication_dose_id` echoes the dose
 - **AND** the dose row's `tracking_log_id` SHALL now point at the new log; the dose's `scheduled_at` is unchanged
+- **AND** the persisted log's `pain_level` SHALL equal the submitted value
+
+#### Scenario: Patient logs against a PILLS or DROPS scheduled dose without pain_level
+- **WHEN** the patient POSTs with a valid `medication_dose_id` resolving to a `PILLS` or `DROPS` schedule and omits `pain_level` (or sends it as `null`)
+- **THEN** the system SHALL respond `201` with a `TrackingLogResource`
+- **AND** the persisted log's `pain_level` SHALL be `NULL`
+
+#### Scenario: Patient logs against a custom (non-Rx) scheduled dose without pain_level
+- **WHEN** the patient POSTs with a valid `medication_dose_id` resolving to a schedule whose `product_id IS NULL` and omits `pain_level`
+- **THEN** the system SHALL respond `201` with a `TrackingLogResource`
+- **AND** the persisted log's `pain_level` SHALL be `NULL`
+
+#### Scenario: Patient sends pain_level for a non-injection schedule
+- **WHEN** the patient POSTs with `pain_level` present on a `PILLS`, `DROPS`, or custom (`product_id IS NULL`) schedule
+- **THEN** the system SHALL respond `422` with `{"message": "The pain level field must not be present for this medication."}`
+- **AND** no `tracking_logs` row SHALL be persisted; the dose's `tracking_log_id` SHALL remain unchanged
+
+#### Scenario: Patient omits pain_level for an injection schedule
+- **WHEN** the patient POSTs against an injection schedule without `pain_level`
+- **THEN** the system SHALL respond `422` with `{"message": "The pain level field is required for this medication."}`
 
 #### Scenario: Patient omits `dose_unit`
 - **WHEN** the patient POSTs without `dose_unit`
@@ -546,10 +617,32 @@ The system SHALL expose `POST /api/v1/patient/medication-tracking/tracking-logs/
 
 `logged_at` MUST be strict ISO 8601 with offset and SHALL default to "now". The action SHALL throw `OffScheduleLogWindowException` when `logged_at > now + 1 day` ("Off-schedule logs cannot be created in the future.") or when `logged_at < now - 90 days` ("Off-schedule logs cannot be backfilled more than 90 days in the past."), which the controller MUST map to `422`.
 
-#### Scenario: Patient logs an off-schedule dose
-- **WHEN** the patient POSTs with a valid `medication_tracking_schedule_id`, `medication_action`, `dose_value`, `dose_unit`, `pain_level`, optional `note`, and an in-window `logged_at`
+`pain_level` (integer, `between:0,10`) SHALL be required if and only if the resolved schedule's product is of type `INJECTION`. For schedules whose product is `PILLS` or `DROPS`, or for custom schedules whose `product_id IS NULL`, `pain_level` MUST be absent (or explicitly `null`); supplying a value SHALL cause the action to throw `PainLevelDoesNotMatchProductException` ("The pain level field must not be present for this medication."), which the controller MUST map to `422` with a `{"message": ...}` body. Omitting `pain_level` for an injection schedule SHALL throw the same exception with the message "The pain level field is required for this medication." When the rule allows omission, the persisted `tracking_logs.pain_level` SHALL be `NULL`.
+
+#### Scenario: Patient logs an off-schedule dose for an injection
+- **WHEN** the patient POSTs against an injection schedule with valid `medication_tracking_schedule_id`, `medication_action`, `dose_value`, `dose_unit`, `pain_level`, optional `note`, and an in-window `logged_at`
 - **THEN** the system SHALL respond `201` with a `TrackingLogResource`
 - **AND** there SHALL be a new `medication_tracking_scheduled_doses` row with `type=off_schedule`, `intake_id=NULL`, `scheduled_at=log.logged_at`, `planned_quantity=log.dose_value`, `planned_unit=request.dose_unit`, `tracking_log_id=log.id`, and `timezone=schedule.timezone`
+- **AND** the persisted log's `pain_level` SHALL equal the submitted value
+
+#### Scenario: Patient logs an off-schedule dose for a PILLS or DROPS schedule without pain_level
+- **WHEN** the patient POSTs against a `PILLS` or `DROPS` schedule with the required fields and omits `pain_level`
+- **THEN** the system SHALL respond `201`
+- **AND** the persisted log's `pain_level` SHALL be `NULL`
+
+#### Scenario: Patient logs an off-schedule dose for a custom schedule without pain_level
+- **WHEN** the patient POSTs against a schedule whose `product_id IS NULL` and omits `pain_level`
+- **THEN** the system SHALL respond `201`
+- **AND** the persisted log's `pain_level` SHALL be `NULL`
+
+#### Scenario: Patient sends pain_level off-schedule against a non-injection schedule
+- **WHEN** the patient POSTs `pain_level` with a request that targets a `PILLS`, `DROPS`, or custom schedule
+- **THEN** the system SHALL respond `422` with `{"message": "The pain level field must not be present for this medication."}`
+- **AND** no `tracking_logs` row and no `medication_tracking_scheduled_doses` row SHALL be persisted
+
+#### Scenario: Patient omits pain_level off-schedule for an injection schedule
+- **WHEN** the patient POSTs against an injection schedule without `pain_level`
+- **THEN** the system SHALL respond `422` with `{"message": "The pain level field is required for this medication."}`
 
 #### Scenario: Schedule does not belong to the patient
 - **WHEN** the resolved schedule has a different `patient_id`
