@@ -13,7 +13,7 @@ For `every_day`, `weekly`, and `every_few_days` schedules, the `schedule_rule.in
 
 `localStartsOn` (the request's `starts_on` interpreted in the request's `timezone`) SHALL NOT be earlier than today in that timezone. Enforcement happens in `CreateScheduleValidator::assertStartsOnNotInPast(...)` as the FIRST step of `validate(...)`, mirroring `UpdateScheduleValidator::assertEndsOnNotInPast(...)` on the edit path. A violation SHALL throw `StartsOnInPastException` (extending `\DomainException`); the controller SHALL map it to `422 {"message": "The starts_on date cannot be before today in the schedule timezone."}`. The check MUST run before any DB query, so a past-`starts_on` request SHALL NOT incur the schedule-cap `count(*)` or the duplicate-order existence lookup. When `starts_on` is omitted on the `as_needed` path, `CreateRequest::getStartsOnLocal()` SHALL continue to default it to "today in the provided timezone" — the check is satisfied trivially.
 
-The `timezone` field SHALL accept any IANA name in PHP's `DateTimeZone::ALL_WITH_BC` set — i.e. canonical zones (e.g. `Europe/Kyiv`, `America/New_York`) **and** the backward-compatibility aliases PHP recognizes (`Europe/Kiev`, `US/Eastern`, `Asia/Calcutta`, …). The stored and returned value MUST equal the value the patient submitted; the system makes no claim about a canonical form. Unknown identifiers (case-mismatched or not in `ALL_WITH_BC`) MUST be rejected with `422`.
+The `timezone` field SHALL accept any IANA name in PHP's `DateTimeZone::ALL_WITH_BC` set — i.e. canonical zones (e.g. `Europe/Kyiv`, `America/New_York`) **and** the backward-compatibility aliases PHP recognizes (`Europe/Kiev`, `US/Eastern`, `Asia/Calcutta`, …). Deprecated aliases covered by the [[timezone-normalization]] capability (at minimum `Europe/Kiev`) SHALL be normalized to their canonical form (`Europe/Kyiv`) at the request boundary, so the stored and returned value is the canonical identifier rather than the submitted alias; values with no normalization entry are stored and returned unchanged. Unknown identifiers (case-mismatched or not in `ALL_WITH_BC`) MUST be rejected with `422`.
 
 #### Scenario: Patient creates an every-day custom schedule
 - **WHEN** the patient POSTs to `/api/v1/patient/medication-tracking/schedules` with `schedule_type=every_day`, `starts_on`, a valid IANA `timezone`, and 1–16 intakes each with `time` (`H:i`), `quantity > 0`, and a `unit` from `DoseUnit`
@@ -51,8 +51,9 @@ The `timezone` field SHALL accept any IANA name in PHP's `DateTimeZone::ALL_WITH
 - **THEN** the system SHALL respond `422` with a validation error on `timezone`
 
 #### Scenario: Patient sends a deprecated IANA alias
-- **WHEN** the patient POSTs with `timezone=Europe/Kiev` (or any other backward-compatibility alias such as `US/Eastern`, `Asia/Calcutta`)
-- **THEN** the system SHALL respond `201` with the schedule persisted using the same string the patient sent
+- **WHEN** the patient POSTs with `timezone=Europe/Kiev`
+- **THEN** the system SHALL respond `201` with the schedule persisted and returned using the canonical form `Europe/Kyiv`
+- **AND** an alias that has no normalization entry (e.g. `US/Eastern`, `Asia/Calcutta`) SHALL be persisted unchanged
 
 #### Scenario: Patient sends `ends_on` earlier than `starts_on`
 - **WHEN** the patient POSTs with `ends_on < starts_on`
